@@ -160,6 +160,124 @@ function stockMetadata(ticker: string) {
   }
 }
 
+// ─── Real-backend response mappers ────────────────────────────────────────────
+// The live API returns raw pipeline/CSV shapes (snake_case, nested result
+// wrappers). These map each real shape onto the UI's existing view models —
+// verified against backend/api.py, backend/quality_signals_api.py, and
+// backend/backtest.py directly.
+
+// /stock/{ticker} row shape: real feature-pipeline CSV columns (see
+// backend/features.py), not the DayRecord shape this file used to assume.
+function mapDayRecord(row: Record<string, unknown>): DayRecord {
+  const avrComponent = Number(row.AVR_Component ?? 0)
+  const carComponent = Number(row.CAR_Component ?? 0)
+  const proximityComponent = Number(row.Proximity_Component ?? 0)
+  const top = Math.max(avrComponent, carComponent, proximityComponent)
+  let signalType = 'None'
+  if (top > 0) {
+    if (top === avrComponent) signalType = 'AVR Spike'
+    else if (top === carComponent) signalType = 'CAR Spike'
+    else signalType = 'Event Proximity'
+  }
+  return {
+    date: String(row.Date ?? ''),
+    suspicionScore: Number(row.Suspicion_Score ?? 0),
+    avr: Number(row.AVR ?? 0),
+    car: Number(row.CAR_10 ?? 0) * 100, // CAR_10 is stored as a fraction (e.g. 0.06 = 6%)
+    ifAnomaly: Number(row.IF_Flag ?? 0) === 1,
+    // The backend does not currently compute real days-to-corporate-event
+    // proximity (Proximity_Component is a suspicion-score weight, not a day
+    // count) — defaulted to 0 until that data exists upstream.
+    eventProximity: 0,
+    flagged: Number(row.Suspicion_Flag ?? 0) === 1,
+    signalType,
+  }
+}
+
+function normalizeStockHistory(payload: unknown, fallbackTicker: string): StockHistoryResponse {
+  const body = payload as { ticker?: string; data?: Record<string, unknown>[] }
+  const rows = Array.isArray(body?.data) ? body.data : []
+  const ticker = (body?.ticker ?? fallbackTicker).toUpperCase()
+  return {
+    ticker,
+    company: stockMetadata(ticker).company,
+    records: rows.map(mapDayRecord),
+  }
+}
+
+function qualityTierFromScore(score: number): 'High' | 'Medium' | 'Low' | 'Poor' {
+  if (score >= 70) return 'High'
+  if (score >= 50) return 'Medium'
+  if (score >= 30) return 'Low'
+  return 'Poor'
+}
+
+// Shared by getQualitySignals() and getStockQualitySignal(): real backend
+// shape is { ticker, suitability, candidate_windows, confirmed_events[], n_confirmed }
+// — not the flat QualitySignal shape. confirmed_events is pre-sorted by
+// window_score descending (from detect_event_windows()), so [0] is the
+// stock's single strongest confirmed event.
+function mapQualityResult(r: Record<string, unknown>): QualitySignal {
+  const ticker = String(r.ticker ?? '')
+  const events = Array.isArray(r.confirmed_events) ? (r.confirmed_events as Record<string, unknown>[]) : []
+  const best = events[0]
+  const windowScore = Number(best?.window_score ?? 0)
+  return {
+    ticker,
+    ...stockMetadata(ticker),
+    window_score: windowScore,
+    forward_return_pct: Number(best?.max_abs_return_pct ?? 0),
+    signals_in_window: Number(best?.max_signals_same_day ?? 0),
+    avr_avg: Number(best?.peak_avr ?? 0),
+    suitable: Number(r.n_confirmed ?? 0) > 0,
+    quality_tier: qualityTierFromScore(windowScore),
+  }
+}
+
+// Real shape: { stocks: [{ ticker, suitability_score, grade, verdict, ... }] }
+function mapSuitabilityItem(s: Record<string, unknown>): SuitabilityRanking {
+  const ticker = String(s.ticker ?? '')
+  const score = Number(s.suitability_score ?? 0)
+  const grade = String(s.grade ?? 'F')
+  return {
+    ticker,
+    ...stockMetadata(ticker),
+    suitability_score: score,
+    quality_tier: grade === 'A' ? 'High' : grade === 'B' ? 'Medium' : grade === 'C' ? 'Low' : 'Poor',
+    // The suitability endpoint scores liquidity/volatility fit only — it doesn't
+    // run event-window detection, so these two have no real value to report here.
+    window_score: 0,
+    forward_return_pct: 0,
+    recommended: grade === 'A' || grade === 'B',
+  }
+}
+
+// Shared by getBacktestResults() and getStockBacktest(): real shape is
+// { ticker, total_days, flagged_events, events[], avg_returns: {1_month,3_month,...}, ... }
+// — not the flat BacktestResult shape. Uses the 3-month window as the
+// headline figure (the event-study horizon quality_signals.py itself
+// validates against) with 1M fallback if 3M data isn't available yet.
+function mapBacktestResult(r: Record<string, unknown>): BacktestResult {
+  const ticker = String(r.ticker ?? '')
+  const events = Array.isArray(r.events) ? (r.events as Record<string, unknown>[]) : []
+  const returns3m = events
+    .map((e) => e['Return_3MONTH_%'])
+    .filter((v): v is number => typeof v === 'number')
+  const avgReturns = (r.avg_returns ?? {}) as Record<string, number | null>
+  const avg = avgReturns['3_month'] ?? avgReturns['1_month'] ?? 0
+  return {
+    ticker,
+    ...stockMetadata(ticker),
+    avg_forward_return_pct: Number(avg ?? 0),
+    max_forward_return_pct: returns3m.length ? Math.max(...returns3m) : 0,
+    min_forward_return_pct: returns3m.length ? Math.min(...returns3m) : 0,
+    win_rate_pct: returns3m.length
+      ? Number(((returns3m.filter((v) => v > 0).length / returns3m.length) * 100).toFixed(1))
+      : 0,
+    sample_size: Number(r.flagged_events ?? events.length),
+  }
+}
+
 // The live API currently returns compact payloads (tickers[] and flagged_stocks[])
 // while the UI uses richer view models. Normalize them at this boundary so every
 // page stays typed and the backend can evolve without duplicating mapping logic.
@@ -240,8 +358,8 @@ export async function getStockHistory(
 ): Promise<ApiResult<StockHistoryResponse>> {
   const upper = ticker.toUpperCase()
   try {
-    const data = await getJSON<StockHistoryResponse>(`/stock/${encodeURIComponent(ticker)}`)
-    return { data, demo: false }
+    const payload = await getJSON<unknown>(`/stock/${encodeURIComponent(ticker)}`)
+    return { data: normalizeStockHistory(payload, ticker), demo: false }
   } catch (err) {
     console.log('[v0] getStockHistory fell back to mock:', (err as Error).message)
     const data =
@@ -304,8 +422,11 @@ export async function getQualitySignals(
 ): Promise<ApiResult<QualitySignal[]>> {
   try {
     const query = params ? new URLSearchParams(Object.entries(params).map(([k, v]) => [k, String(v)])).toString() : ''
-    const data = await getJSON<QualitySignal[]>(`/quality-signals${query ? `?${query}` : ''}`)
-    return { data, demo: false }
+    const payload = await getJSON<unknown>(`/quality-signals${query ? `?${query}` : ''}`)
+    const results = Array.isArray(payload)
+      ? payload
+      : (payload as { results?: unknown[] })?.results ?? []
+    return { data: (results as Record<string, unknown>[]).map(mapQualityResult), demo: false }
   } catch (err) {
     console.log('[v0] getQualitySignals fell back to mock:', (err as Error).message)
     return { data: [], demo: true }
@@ -315,10 +436,15 @@ export async function getQualitySignals(
 // Endpoint 8: GET /quality-signals/{ticker} → one stock quality signals
 export async function getStockQualitySignal(ticker: string): Promise<ApiResult<StockQualitySignal>> {
   try {
-    const data = await getJSON<StockQualitySignal>(
+    const payload = await getJSON<Record<string, unknown>>(
       `/quality-signals/${encodeURIComponent(ticker)}`,
     )
-    return { data, demo: false }
+    const base = mapQualityResult(payload)
+    const suitability = payload.suitability as { verdict?: string } | undefined
+    const detailed_analysis =
+      `${Number(payload.n_confirmed ?? 0)} confirmed event(s) of ${Number(payload.candidate_windows ?? 0)} candidate window(s)` +
+      (suitability?.verdict ? ` — ${suitability.verdict}` : '')
+    return { data: { ...base, detailed_analysis }, demo: false }
   } catch (err) {
     console.log('[v0] getStockQualitySignal fell back to mock:', (err as Error).message)
     return {
@@ -341,8 +467,11 @@ export async function getStockQualitySignal(ticker: string): Promise<ApiResult<S
 // Endpoint 9: GET /quality-signals/suitability → all stocks ranked by suitability
 export async function getSuitabilityRanking(): Promise<ApiResult<SuitabilityRanking[]>> {
   try {
-    const data = await getJSON<SuitabilityRanking[]>('/quality-signals/suitability')
-    return { data, demo: false }
+    const payload = await getJSON<unknown>('/quality-signals/suitability')
+    const stocks = Array.isArray(payload)
+      ? payload
+      : (payload as { stocks?: unknown[] })?.stocks ?? []
+    return { data: (stocks as Record<string, unknown>[]).map(mapSuitabilityItem), demo: false }
   } catch (err) {
     console.log('[v0] getSuitabilityRanking fell back to mock:', (err as Error).message)
     return { data: [], demo: true }
@@ -352,8 +481,11 @@ export async function getSuitabilityRanking(): Promise<ApiResult<SuitabilityRank
 // Endpoint 10: GET /backtest → forward return analysis all stocks
 export async function getBacktestResults(): Promise<ApiResult<BacktestResult[]>> {
   try {
-    const data = await getJSON<BacktestResult[]>('/backtest')
-    return { data, demo: false }
+    const payload = await getJSON<unknown>('/backtest')
+    const results = Array.isArray(payload)
+      ? payload
+      : (payload as { results?: unknown[] })?.results ?? []
+    return { data: (results as Record<string, unknown>[]).map(mapBacktestResult), demo: false }
   } catch (err) {
     console.log('[v0] getBacktestResults fell back to mock:', (err as Error).message)
     return { data: [], demo: true }
@@ -363,8 +495,16 @@ export async function getBacktestResults(): Promise<ApiResult<BacktestResult[]>>
 // Endpoint 11: GET /backtest/{ticker} → forward return for one stock
 export async function getStockBacktest(ticker: string): Promise<ApiResult<StockBacktestResult>> {
   try {
-    const data = await getJSON<StockBacktestResult>(`/backtest/${encodeURIComponent(ticker)}`)
-    return { data, demo: false }
+    const payload = await getJSON<Record<string, unknown>>(`/backtest/${encodeURIComponent(ticker)}`)
+    const base = mapBacktestResult(payload)
+    const events = Array.isArray(payload.events) ? (payload.events as Record<string, unknown>[]) : []
+    const return_distribution = events
+      .map((e) => e['Return_3MONTH_%'])
+      .filter((v): v is number => typeof v === 'number')
+    return {
+      data: { ...base, return_distribution: return_distribution.length ? return_distribution : undefined },
+      demo: false,
+    }
   } catch (err) {
     console.log('[v0] getStockBacktest fell back to mock:', (err as Error).message)
     return {

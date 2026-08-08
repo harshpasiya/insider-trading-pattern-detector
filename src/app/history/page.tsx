@@ -8,7 +8,7 @@ import { DataTable, type Column } from '@/components/DataTable'
 import { RiskPill, Pill } from '@/components/RiskPill'
 import { DemoBadge } from '@/components/DemoBadge'
 import { FilterChips } from '@/components/FilterChips'
-import { getStocks, getStockHistory } from '@/lib/api'
+import { getStocks, getStockHistory, getFlags } from '@/lib/api'
 import { formatDate, tierFromScore, exportToCSV } from '@/lib/utils'
 import type { HistoricalEvent } from '@/lib/types'
 
@@ -34,21 +34,34 @@ export default function HistoricalLogPage() {
   React.useEffect(() => {
     let active = true
     // NOTE: This page aggregates cross-stock flagged history client-side by
-    // calling getStockHistory() for every tracked ticker and collecting the
-    // days that crossed the flag threshold. There is no single backend
-    // endpoint that returns cross-stock history yet — when Person A adds a
-    // dedicated endpoint (e.g. GET /history), replace this fan-out with a
-    // single call here.
+    // calling getStockHistory() for every ticker that /flags reports has at
+    // least one flagged day (see below), and collecting the days that
+    // crossed the flag threshold. There is no single backend endpoint that
+    // returns cross-stock history yet — when Person A adds a dedicated
+    // endpoint (e.g. GET /history), replace this fan-out with a single call.
     async function load() {
-      const stocksRes = await getStocks()
-      let anyDemo = stocksRes.demo
+      const [stocksRes, flagsRes] = await Promise.all([getStocks(), getFlags()])
+      let anyDemo = stocksRes.demo || flagsRes.demo
+
+      // Real /stock/{ticker} returns a stock's ENTIRE multi-year history
+      // (thousands of rows) — fanning that out across all tracked tickers
+      // just to find the handful of flagged days is far too much data to
+      // pull for a real universe. /flags already reports each ticker's
+      // flagged_days count, so we only fetch full history for tickers that
+      // actually have at least one flagged day; the rest contribute nothing
+      // to this log and are skipped entirely.
+      const flaggedDaysByTicker = new Map(flagsRes.data.map((f) => [f.ticker, f.flaggedDays]))
+      const tickersWithFlags = stocksRes.data.filter(
+        (s) => (flaggedDaysByTicker.get(s.ticker) ?? 0) > 0,
+      )
+
       const histories = await Promise.all(
-        stocksRes.data.map((s) => getStockHistory(s.ticker)),
+        tickersWithFlags.map((s) => getStockHistory(s.ticker)),
       )
       const collected: HistoricalEvent[] = []
       histories.forEach((h, idx) => {
         if (h.demo) anyDemo = true
-        const company = stocksRes.data[idx].company
+        const company = tickersWithFlags[idx].company
         h.data.records
           .filter((r) => r.flagged)
           .forEach((r) => {

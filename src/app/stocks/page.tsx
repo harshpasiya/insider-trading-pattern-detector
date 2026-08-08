@@ -8,12 +8,12 @@ import { DataTable, type Column } from '@/components/DataTable'
 import { RiskPill, Pill } from '@/components/RiskPill'
 import { DemoBadge } from '@/components/DemoBadge'
 import { FilterChips } from '@/components/FilterChips'
-import { getStocks } from '@/lib/api'
-import { formatDate, exportToCSV } from '@/lib/utils'
+import { getStocks, getFlags } from '@/lib/api'
+import { formatDate, exportToCSV, tierFromScore } from '@/lib/utils'
 import type { StockListItem } from '@/lib/types'
 
 const RISK_TIERS = ['All', 'Critical', 'High', 'Medium', 'Low', 'Clean']
-const SECTORS = ['All', 'Banking', 'IT', 'Energy', 'Pharma', 'Auto', 'FMCG', 'NBFC', 'Utilities']
+const SECTORS = ['All', 'Banking', 'IT', 'Energy', 'Pharma', 'Auto', 'FMCG', 'NBFC', 'Utilities', 'Equity']
 const DATE_RANGES = ['Any time', 'Last 30 days', 'Last 60 days', 'Last 90 days']
 
 function withinDays(dateStr: string | null, days: number): boolean {
@@ -36,10 +36,25 @@ export default function StocksExplorerPage() {
 
   React.useEffect(() => {
     let active = true
-    getStocks().then((res) => {
+    // /stocks alone has no score/risk data — /flags covers every scorable
+    // ticker (not just a "top N" subset, see build_flags_summary()), so we
+    // cross-reference it here to get each stock's real peak score and risk
+    // tier instead of leaving every real ticker stuck at the Clean/0 default.
+    Promise.all([getStocks(), getFlags()]).then(([stocksRes, flagsRes]) => {
       if (!active) return
-      setStocks(res.data)
-      setDemo(res.demo)
+      const flagByTicker = new Map(flagsRes.data.map((f) => [f.ticker, f]))
+      const enriched = stocksRes.data.map((s) => {
+        const flag = flagByTicker.get(s.ticker)
+        if (!flag) return s
+        return {
+          ...s,
+          latestScore: flag.peakScore,
+          riskTier: tierFromScore(flag.peakScore),
+          lastFlagged: flag.flaggedDate || s.lastFlagged,
+        }
+      })
+      setStocks(enriched)
+      setDemo(stocksRes.demo || flagsRes.demo)
       setLoading(false)
     })
     return () => {
