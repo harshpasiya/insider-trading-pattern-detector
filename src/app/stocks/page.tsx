@@ -8,80 +8,55 @@ import { DataTable, type Column } from '@/components/DataTable'
 import { RiskPill, Pill } from '@/components/RiskPill'
 import { DemoBadge } from '@/components/DemoBadge'
 import { FilterChips } from '@/components/FilterChips'
-import { getStocks, getStockHistory, getFlags } from '@/lib/api'
-import { formatDate, tierFromScore, exportToCSV } from '@/lib/utils'
-import type { HistoricalEvent } from '@/lib/types'
+import { getStocks, getFlags } from '@/lib/api'
+import { formatDate, exportToCSV, tierFromScore } from '@/lib/utils'
+import type { StockListItem } from '@/lib/types'
 
-const RISK_TIERS = ['All', 'Critical', 'High', 'Medium', 'Low']
+const RISK_TIERS = ['All', 'Critical', 'High', 'Medium', 'Low', 'Clean']
+const SECTORS = ['All', 'Banking', 'IT', 'Energy', 'Pharma', 'Auto', 'FMCG', 'NBFC', 'Utilities', 'Equity']
 const DATE_RANGES = ['Any time', 'Last 30 days', 'Last 60 days', 'Last 90 days']
 
-function withinDays(dateStr: string, days: number): boolean {
+function withinDays(dateStr: string | null, days: number): boolean {
+  if (!dateStr) return false
   const cutoff = new Date('2026-06-24')
   cutoff.setDate(cutoff.getDate() - days)
   return new Date(dateStr) >= cutoff
 }
 
-export default function HistoricalLogPage() {
+export default function StocksExplorerPage() {
   const router = useRouter()
-  const [events, setEvents] = React.useState<HistoricalEvent[]>([])
+  const [stocks, setStocks] = React.useState<StockListItem[]>([])
   const [loading, setLoading] = React.useState(true)
   const [demo, setDemo] = React.useState(false)
 
   const [search, setSearch] = React.useState('')
   const [tier, setTier] = React.useState('All')
+  const [sector, setSector] = React.useState('All')
   const [dateRange, setDateRange] = React.useState('Any time')
 
   React.useEffect(() => {
     let active = true
-    // NOTE: This page aggregates cross-stock flagged history client-side by
-    // calling getStockHistory() for every ticker that /flags reports has at
-    // least one flagged day (see below), and collecting the days that
-    // crossed the flag threshold. There is no single backend endpoint that
-    // returns cross-stock history yet — when Person A adds a dedicated
-    // endpoint (e.g. GET /history), replace this fan-out with a single call.
-    async function load() {
-      const [stocksRes, flagsRes] = await Promise.all([getStocks(), getFlags()])
-      let anyDemo = stocksRes.demo || flagsRes.demo
-
-      // Real /stock/{ticker} returns a stock's ENTIRE multi-year history
-      // (thousands of rows) — fanning that out across all tracked tickers
-      // just to find the handful of flagged days is far too much data to
-      // pull for a real universe. /flags already reports each ticker's
-      // flagged_days count, so we only fetch full history for tickers that
-      // actually have at least one flagged day; the rest contribute nothing
-      // to this log and are skipped entirely.
-      const flaggedDaysByTicker = new Map(flagsRes.data.map((f) => [f.ticker, f.flaggedDays]))
-      const tickersWithFlags = stocksRes.data.filter(
-        (s) => (flaggedDaysByTicker.get(s.ticker) ?? 0) > 0,
-      )
-
-      const histories = await Promise.all(
-        tickersWithFlags.map((s) => getStockHistory(s.ticker)),
-      )
-      const collected: HistoricalEvent[] = []
-      histories.forEach((h, idx) => {
-        if (h.demo) anyDemo = true
-        const company = tickersWithFlags[idx].company
-        h.data.records
-          .filter((r) => r.flagged)
-          .forEach((r) => {
-            collected.push({
-              date: r.date,
-              ticker: h.data.ticker,
-              company,
-              score: r.suspicionScore,
-              riskTier: tierFromScore(r.suspicionScore),
-              signalType: r.signalType ?? 'Composite Signal',
-            })
-          })
-      })
-      collected.sort((a, b) => b.date.localeCompare(a.date))
+    // /stocks alone has no score/risk data — /flags covers every scorable
+    // ticker (not just a "top N" subset, see build_flags_summary()), so we
+    // cross-reference it here to get each stock's real peak score and risk
+    // tier instead of leaving every real ticker stuck at the Clean/0 default.
+    Promise.all([getStocks(), getFlags()]).then(([stocksRes, flagsRes]) => {
       if (!active) return
-      setEvents(collected)
-      setDemo(anyDemo)
+      const flagByTicker = new Map(flagsRes.data.map((f) => [f.ticker, f]))
+      const enriched = stocksRes.data.map((s) => {
+        const flag = flagByTicker.get(s.ticker)
+        if (!flag) return s
+        return {
+          ...s,
+          latestScore: flag.peakScore,
+          riskTier: tierFromScore(flag.peakScore),
+          lastFlagged: flag.flaggedDate || s.lastFlagged,
+        }
+      })
+      setStocks(enriched)
+      setDemo(stocksRes.demo || flagsRes.demo)
       setLoading(false)
-    }
-    load()
+    })
     return () => {
       active = false
     }
@@ -89,79 +64,87 @@ export default function HistoricalLogPage() {
 
   const filtered = React.useMemo(() => {
     const q = search.trim().toLowerCase()
-    return events.filter((e) => {
-      if (q && !e.ticker.toLowerCase().includes(q) && !e.company.toLowerCase().includes(q))
+    return stocks.filter((s) => {
+      if (q && !s.ticker.toLowerCase().includes(q) && !s.company.toLowerCase().includes(q))
         return false
-      if (tier !== 'All' && e.riskTier !== tier) return false
-      if (dateRange === 'Last 30 days' && !withinDays(e.date, 30)) return false
-      if (dateRange === 'Last 60 days' && !withinDays(e.date, 60)) return false
-      if (dateRange === 'Last 90 days' && !withinDays(e.date, 90)) return false
+      if (tier !== 'All' && s.riskTier !== tier) return false
+      if (sector !== 'All' && s.sector !== sector) return false
+      if (dateRange === 'Last 30 days' && !withinDays(s.lastFlagged, 30)) return false
+      if (dateRange === 'Last 60 days' && !withinDays(s.lastFlagged, 60)) return false
+      if (dateRange === 'Last 90 days' && !withinDays(s.lastFlagged, 90)) return false
       return true
     })
-  }, [events, search, tier, dateRange])
+  }, [stocks, search, tier, sector, dateRange])
 
-  const columns: Column<HistoricalEvent>[] = [
-    {
-      key: 'date',
-      header: 'Date',
-      priority: true,
-      render: (e) => <span className="text-foreground">{formatDate(e.date)}</span>,
-      sortValue: (e) => e.date,
-    },
+  const columns: Column<StockListItem>[] = [
     {
       key: 'ticker',
       header: 'Ticker',
       priority: true,
-      render: (e) => <span className="font-medium text-foreground">{e.ticker}</span>,
-      sortValue: (e) => e.ticker,
+      render: (r) => <span className="font-medium text-foreground">{r.ticker}</span>,
+      sortValue: (r) => r.ticker,
     },
     {
       key: 'company',
       header: 'Company',
-      render: (e) => <span className="text-muted">{e.company}</span>,
-      sortValue: (e) => e.company,
+      render: (r) => <span className="text-muted">{r.company}</span>,
+      sortValue: (r) => r.company,
     },
     {
-      key: 'score',
+      key: 'sector',
+      header: 'Sector',
+      render: (r) => <Pill color="gray">{r.sector}</Pill>,
+      sortValue: (r) => r.sector,
+    },
+    {
+      key: 'exchange',
+      header: 'Exchange',
+      render: (r) => <span className="text-muted">{r.exchange}</span>,
+      sortValue: (r) => r.exchange,
+    },
+    {
+      key: 'latestScore',
       header: 'Score',
       align: 'right',
       priority: true,
-      render: (e) => <span className="font-medium tabular-nums">{e.score}</span>,
-      sortValue: (e) => e.score,
+      render: (r) => <span className="font-medium tabular-nums">{r.latestScore}</span>,
+      sortValue: (r) => r.latestScore,
     },
     {
       key: 'riskTier',
       header: 'Risk',
-      render: (e) => <RiskPill tier={e.riskTier} />,
-      sortValue: (e) => e.score,
+      priority: true,
+      render: (r) => <RiskPill tier={r.riskTier} />,
+      sortValue: (r) => r.latestScore,
     },
     {
-      key: 'signalType',
-      header: 'Signal Type',
-      render: (e) => <Pill color="blue">{e.signalType}</Pill>,
-      sortValue: (e) => e.signalType,
+      key: 'lastFlagged',
+      header: 'Last Flagged',
+      render: (r) => <span className="text-muted">{formatDate(r.lastFlagged)}</span>,
+      sortValue: (r) => r.lastFlagged ?? '',
     },
   ]
 
   function handleExport() {
     exportToCSV(
-      filtered.map((e) => ({
-        Date: e.date,
-        Ticker: e.ticker,
-        Company: e.company,
-        Score: e.score,
-        RiskTier: e.riskTier,
-        SignalType: e.signalType,
+      filtered.map((s) => ({
+        Ticker: s.ticker,
+        Company: s.company,
+        Sector: s.sector,
+        Exchange: s.exchange,
+        RiskTier: s.riskTier,
+        LatestScore: s.latestScore,
+        LastFlagged: s.lastFlagged ?? '',
       })),
-      'tradewatch-historical-log.csv',
+      'tradewatch-stocks.csv',
     )
   }
 
   return (
     <div>
       <PageHeader
-        title="Historical Log"
-        subtitle="Every flagged trading day, aggregated across all monitored stocks."
+        title="Stocks Explorer"
+        subtitle="Search, filter, and browse every tracked NSE & BSE ticker."
         badge={!loading && demo ? <DemoBadge /> : undefined}
         action={
           <button
@@ -176,7 +159,7 @@ export default function HistoricalLogPage() {
         }
       />
 
-      {/* Search */}
+      {/* Search box */}
       <div className="relative mb-3 max-w-md">
         <Search
           size={14}
@@ -189,31 +172,35 @@ export default function HistoricalLogPage() {
           onChange={(e) => setSearch(e.target.value)}
           placeholder="Search ticker or company…"
           className="w-full rounded-md border border-border bg-card py-1.5 pl-8 pr-3 text-xs sm:text-sm text-foreground placeholder:text-faint focus:border-[var(--color-accent)] focus:outline-none"
-          aria-label="Search historical log"
+          aria-label="Search stocks"
         />
       </div>
 
       {/* Filter chips */}
       <div className="mb-3 flex flex-col gap-2 sm:gap-3">
         <FilterChips label="Risk" options={RISK_TIERS} value={tier} onChange={setTier} />
-        <FilterChips label="Date" options={DATE_RANGES} value={dateRange} onChange={setDateRange} />
+        <FilterChips label="Sector" options={SECTORS} value={sector} onChange={setSector} />
+        <FilterChips
+          label="Flagged"
+          options={DATE_RANGES}
+          value={dateRange}
+          onChange={setDateRange}
+        />
       </div>
 
       <p className="mb-2 text-xs text-muted sm:mb-3 sm:text-sm">
-        {loading
-          ? 'Aggregating flagged events…'
-          : `${filtered.length} flagged event${filtered.length !== 1 ? 's' : ''}`}
+        {loading ? 'Loading…' : `${filtered.length} stock${filtered.length !== 1 ? 's' : ''}`}
       </p>
 
       <DataTable
         columns={columns}
         rows={filtered}
-        rowKey={(e) => `${e.ticker}-${e.date}`}
-        onRowClick={(e) => router.push(`/stocks/${encodeURIComponent(e.ticker)}`)}
+        rowKey={(r) => r.ticker}
+        onRowClick={(r) => router.push(`/stocks/${encodeURIComponent(r.ticker)}`)}
         loading={loading}
-        emptyMessage="No flagged events match your filters."
-        initialSort={{ key: 'date', dir: 'desc' }}
-        pageSize={15}
+        emptyMessage="No stocks match your filters."
+        initialSort={{ key: 'latestScore', dir: 'desc' }}
+        pageSize={12}
       />
     </div>
   )

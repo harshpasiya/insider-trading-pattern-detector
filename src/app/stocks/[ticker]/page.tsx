@@ -189,7 +189,7 @@ export default function StockDetailPage() {
       />
 
       <p className="mt-3 text-xs text-faint">
-        Rows tinted red crossed the flag threshold (score ≥ 60).
+        Rows tinted red crossed the flag threshold (score ≥ 65).
       </p>
     </div>
   )

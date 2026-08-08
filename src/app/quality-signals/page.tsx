@@ -1,6 +1,7 @@
 'use client'
 
 import { useEffect, useState } from 'react'
+import * as React from 'react'
 import { PageHeader } from '@/components/PageHeader'
 import { DemoBadge } from '@/components/DemoBadge'
 import { DataTable, type Column } from '@/components/DataTable'
@@ -13,6 +14,7 @@ export default function QualitySignalsPage() {
   const [defaults, setDefaults] = useState<QualitySignalsDefaults | null>(null)
   const [signals, setSignals] = useState<QualitySignal[]>([])
   const [loading, setLoading] = useState(true)
+  const [refreshing, setRefreshing] = useState(false)
   const [demo, setDemo] = useState(false)
 
   // Settings panel state
@@ -40,23 +42,38 @@ export default function QualitySignalsPage() {
     load()
   }, [])
 
-  // Refetch signals when any slider changes
-  const handleParamChange = async (
-    minWin?: number,
-    minFwd?: number,
-    minSig?: number,
-    avrThr?: number,
-  ) => {
-    const params = {
-      min_window_score: minWin ?? minWindowScore,
-      min_forward_return_pct: minFwd ?? minForwardReturn,
-      min_signals_in_window: minSig ?? minSignals,
-      avr_threshold: avrThr ?? avrThreshold,
-    }
-    const res = await getQualitySignals(params)
-    setSignals(res.data)
-    setDemo(res.demo)
+  // Refetch signals when any slider changes, debounced. Each call re-runs the
+  // full 3-stage detection pipeline across every stock on the real backend —
+  // firing it on every pixel of a drag (the previous behaviour) would queue
+  // dozens of redundant full recomputations per second. This waits until the
+  // user pauses for 400ms, and ignores any response that isn't from the
+  // latest request (in case a slow request resolves after a newer one).
+  const requestIdRef = React.useRef(0)
+  const debounceRef = React.useRef<ReturnType<typeof setTimeout> | null>(null)
+
+  const handleParamChange = (minWin: number, minFwd: number, minSig: number, avrThr: number) => {
+    if (debounceRef.current) clearTimeout(debounceRef.current)
+    setRefreshing(true)
+    debounceRef.current = setTimeout(async () => {
+      const thisRequestId = ++requestIdRef.current
+      const res = await getQualitySignals({
+        min_window_score: minWin,
+        min_forward_return_pct: minFwd,
+        min_signals_in_window: minSig,
+        avr_threshold: avrThr,
+      })
+      if (thisRequestId !== requestIdRef.current) return // a newer request superseded this one
+      setSignals(res.data)
+      setDemo(res.demo)
+      setRefreshing(false)
+    }, 400)
   }
+
+  useEffect(() => {
+    return () => {
+      if (debounceRef.current) clearTimeout(debounceRef.current)
+    }
+  }, [])
 
   const qualityTierColor = (tier: string) => {
     switch (tier) {
@@ -221,6 +238,7 @@ export default function QualitySignalsPage() {
             Matching Stocks
           </h2>
           <Pill color="gray">{signals.length} stocks</Pill>
+          {refreshing && <Pill color="blue">Recalculating…</Pill>}
         </div>
         <DataTable
           rows={signals}
